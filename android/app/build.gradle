@@ -76,13 +76,13 @@ android {
                 }
             }
         }
-        debug {
-            externalNativeBuild {
-                ndkBuild {
-                    arguments "BUILD_TYPE=debug"
-                }
-            }
-        }
+        // debug {
+        //     externalNativeBuild {
+        //         ndkBuild {
+        //             arguments "BUILD_TYPE=debug"
+        //         }
+        //     }
+        // }
     }
 
     // This task executes the comptime script
