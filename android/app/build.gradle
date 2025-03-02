@@ -1,4 +1,4 @@
-def buildAsLibrary = project.hasProperty('BUILD_AS_LIBRARY');
+ def buildAsLibrary = project.hasProperty('BUILD_AS_LIBRARY');
 def buildAsApplication = !buildAsLibrary
 if (buildAsApplication) {
     apply plugin: 'com.android.application'
@@ -76,13 +76,13 @@ android {
                 }
             }
         }
-        // debug {
-        //     externalNativeBuild {
-        //         ndkBuild {
-        //             arguments "BUILD_TYPE=debug"
-        //         }
-        //     }
-        // }
+        debug {
+             externalNativeBuild {
+                 ndkBuild {
+                     arguments "BUILD_TYPE=release"
+                 }
+             }
+         }
     }
 
     // This task executes the comptime script
