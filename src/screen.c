@@ -1,14 +1,14 @@
 // SONIC ROBO BLAST 2
 //-----------------------------------------------------------------------------
 // Copyright (C) 1998-2000 by DooM Legacy Team.
-// Copyright (C) 1999-2023 by Sonic Team Junior.
+// Copyright (C) 1999-2024 by Sonic Team Junior.
 //
 // This program is free software distributed under the
 // terms of the GNU General Public License, version 2.
 // See the 'LICENSE' file for more details.
 //-----------------------------------------------------------------------------
 /// \file  screen.c
-/// \brief Handles multiple resolutions, 8bpp/16bpp(highcolor) modes
+/// \brief Handles multiple resolutions
 
 #include "doomdef.h"
 #include "doomstat.h"
@@ -22,13 +22,12 @@
 #include "r_sky.h"
 #include "m_argv.h"
 #include "m_misc.h"
-#include "m_menu.h"
 #include "v_video.h"
 #include "st_stuff.h"
 #include "hu_stuff.h"
 #include "z_zone.h"
 #include "d_main.h"
-#include "d_clisrv.h"
+#include "netcode/d_clisrv.h"
 #include "f_finale.h"
 #include "y_inter.h" // usebuffer
 #include "i_sound.h" // closed captions
@@ -42,12 +41,10 @@
 #include "hardware/hw_model.h"
 #endif
 
-#ifdef TOUCHINPUTS
-#include "ts_main.h" // touchfingers, NUMTOUCHFINGERS
-#endif
-
 // SRB2Kart
 #include "r_fps.h" // R_GetFramerateCap
+
+#include "lua_hud.h" // LUA_HudEnabled
 
 // --------------------------------------------
 // assembly or c drawer routines for 8bpp/16bpp
@@ -65,7 +62,6 @@ void (*spanfuncs_npo2[SPANDRAWFUNC_MAX])(void);
 viddef_t vid;
 INT32 setmodeneeded; //video mode change needed if > 0 (the mode number to set + 1)
 UINT8 setrenderneeded = 0;
-UINT8 renderswitcherror = 0;
 
 static CV_PossibleValue_t scr_depth_cons_t[] = {{8, "8 bits"}, {16, "16 bits"}, {24, "24 bits"}, {32, "32 bits"}, {0, NULL}};
 
@@ -75,30 +71,6 @@ consvar_t cv_scr_height = CVAR_INIT ("scr_height", "800", CV_SAVE, CV_Unsigned, 
 consvar_t cv_scr_width_w = CVAR_INIT ("scr_width_w", "640", CV_SAVE, CV_Unsigned, NULL);
 consvar_t cv_scr_height_w = CVAR_INIT ("scr_height_w", "400", CV_SAVE, CV_Unsigned, NULL);
 consvar_t cv_scr_depth = CVAR_INIT ("scr_depth", "16 bits", CV_SAVE, scr_depth_cons_t, NULL);
-
-consvar_t cv_renderview = CVAR_INIT ("renderview", "On", 0, CV_OnOff, NULL);
-
-#ifdef NATIVESCREENRES
-static void SCR_ToggleNativeRes(void);
-static void SCR_NativeResDivChanged(void);
-static void SCR_NativeResAutoChanged(void);
-
-static CV_PossibleValue_t nativeresdiv_cons_t[] = {{FRACUNIT, "MIN"}, {20 * FRACUNIT, "MAX"}, {0, NULL}};
-static CV_PossibleValue_t nativerescompare_cons_t[] = {{0, "Width"}, {1, "Height"}, {0, NULL}};
-
-#define NATIVERESCVAR_FLAGS(name, def, possiblevalue, func, flags) CVAR_INIT (name, def, (CV_CALL | CV_SAVE | CV_NOINIT | flags), possiblevalue, func)
-#define NATIVERESCVAR_CALL(name, def, possiblevalue, func) NATIVERESCVAR_FLAGS(name, def, possiblevalue, func, 0)
-#define NATIVERESCVAR(name, def, possiblevalue) NATIVERESCVAR_CALL(name, def, possiblevalue, SCR_ToggleNativeRes)
-
-consvar_t cv_nativeres = NATIVERESCVAR("nativeres", "On", CV_OnOff);
-consvar_t cv_nativeresdiv = NATIVERESCVAR_FLAGS("nativeresdiv", "1", nativeresdiv_cons_t, SCR_NativeResDivChanged, CV_FLOAT);
-consvar_t cv_nativeresauto = NATIVERESCVAR_CALL("nativeresauto", "On", CV_OnOff, SCR_NativeResAutoChanged);
-consvar_t cv_nativeresfov = NATIVERESCVAR_CALL("nativeresfov", "On", CV_OnOff, R_SetViewSize);
-consvar_t cv_nativerescompare = NATIVERESCVAR("nativerescompare", "Height", nativerescompare_cons_t);
-
-#undef NATIVERESCVAR
-
-#endif
 
 CV_PossibleValue_t cv_renderer_t[] = {
 	{1, "Software"},
@@ -118,80 +90,73 @@ consvar_t cv_fullscreen = CVAR_INIT ("fullscreen", "Yes", CV_SAVE|CV_CALL, CV_Ye
 //                           SCREEN VARIABLES
 // =========================================================================
 
-static boolean scr_startupmodeset = false;
-
 INT32 scr_bpp; // current video mode bytes per pixel
-UINT8 *scr_borderpatch; // flat used to fill the reduced view borders set at ST_Init()
-
-#ifdef NATIVESCREENRES
-float scr_resdiv = 1.0f;
-#endif
 
 // =========================================================================
 
-//  Short and Tall sky drawer, for the current color mode
-void (*walldrawerfunc)(void);
-
-boolean R_486 = false;
-boolean R_586 = false;
-boolean R_MMX = false;
-boolean R_SSE = false;
-boolean R_3DNow = false;
-boolean R_MMXExt = false;
-boolean R_SSE2 = false;
-
 void SCR_SetDrawFuncs(void)
 {
-	colfuncs[BASEDRAWFUNC] = R_DrawColumn_8;
-	spanfuncs[BASEDRAWFUNC] = R_DrawSpan_8;
+	//
+	//  setup the right draw routines
+	//
+	if (vid.bpp == 1) //Always run in 8bpp.
+	{
+		colfuncs[BASEDRAWFUNC] = R_DrawColumn_8;
+		spanfuncs[BASEDRAWFUNC] = R_DrawSpan_8;
 
-	colfunc = colfuncs[BASEDRAWFUNC];
-	spanfunc = spanfuncs[BASEDRAWFUNC];
+		colfunc = colfuncs[BASEDRAWFUNC];
+		spanfunc = spanfuncs[BASEDRAWFUNC];
 
-	colfuncs[COLDRAWFUNC_FUZZY] = R_DrawTranslucentColumn_8;
-	colfuncs[COLDRAWFUNC_TRANS] = R_DrawTranslatedColumn_8;
-	colfuncs[COLDRAWFUNC_SHADE] = R_DrawShadeColumn_8;
-	colfuncs[COLDRAWFUNC_SHADOWED] = R_DrawColumnShadowed_8;
-	colfuncs[COLDRAWFUNC_TRANSTRANS] = R_DrawTranslatedTranslucentColumn_8;
-	colfuncs[COLDRAWFUNC_TWOSMULTIPATCH] = R_Draw2sMultiPatchColumn_8;
-	colfuncs[COLDRAWFUNC_TWOSMULTIPATCHTRANS] = R_Draw2sMultiPatchTranslucentColumn_8;
-	colfuncs[COLDRAWFUNC_FOG] = R_DrawFogColumn_8;
+		colfuncs[COLDRAWFUNC_FUZZY] = R_DrawTranslucentColumn_8;
+		colfuncs[COLDRAWFUNC_TRANS] = R_DrawTranslatedColumn_8;
+		colfuncs[COLDRAWFUNC_SHADE] = R_DrawShadeColumn_8;
+		colfuncs[COLDRAWFUNC_SHADOWED] = R_DrawColumnShadowed_8;
+		colfuncs[COLDRAWFUNC_TRANSTRANS] = R_DrawTranslatedTranslucentColumn_8;
+		colfuncs[COLDRAWFUNC_CLAMPED] = R_DrawColumnClamped_8;
+		colfuncs[COLDRAWFUNC_CLAMPEDTRANS] = R_DrawTranslucentColumnClamped_8;
+		colfuncs[COLDRAWFUNC_TWOSMULTIPATCH] = R_Draw2sMultiPatchColumn_8;
+		colfuncs[COLDRAWFUNC_TWOSMULTIPATCHTRANS] = R_Draw2sMultiPatchTranslucentColumn_8;
+		colfuncs[COLDRAWFUNC_FOG] = R_DrawFogColumn_8;
 
-	spanfuncs[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_8;
-	spanfuncs[SPANDRAWFUNC_SPLAT] = R_DrawSplat_8;
-	spanfuncs[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_8;
-	spanfuncs[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_8;
-	spanfuncs[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_8;
-	spanfuncs[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_8;
-	spanfuncs[SPANDRAWFUNC_SOLID] = R_DrawSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_TRANSSOLID] = R_DrawTransSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDSOLID] = R_DrawTiltedSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDTRANSSOLID] = R_DrawTiltedTransSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_WATERSOLID] = R_DrawWaterSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDWATERSOLID] = R_DrawTiltedWaterSolidColorSpan_8;
-	spanfuncs[SPANDRAWFUNC_FOG] = R_DrawFogSpan_8;
-	spanfuncs[SPANDRAWFUNC_TILTEDFOG] = R_DrawTiltedFogSpan_8;
+		spanfuncs[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_8;
+		spanfuncs[SPANDRAWFUNC_SPLAT] = R_DrawSplat_8;
+		spanfuncs[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSPLAT] = R_DrawTiltedTranslucentSplat_8;
+		spanfuncs[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_8;
+		spanfuncs[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_8;
+		spanfuncs[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_8;
+		spanfuncs[SPANDRAWFUNC_SOLID] = R_DrawSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_TRANSSOLID] = R_DrawTransSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDSOLID] = R_DrawTiltedSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSOLID] = R_DrawTiltedTransSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_WATERSOLID] = R_DrawWaterSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDWATERSOLID] = R_DrawTiltedWaterSolidColorSpan_8;
+		spanfuncs[SPANDRAWFUNC_FOG] = R_DrawFogSpan_8;
+		spanfuncs[SPANDRAWFUNC_TILTEDFOG] = R_DrawTiltedFogSpan_8;
 
-	// Lactozilla: Non-powers-of-two
-	spanfuncs_npo2[BASEDRAWFUNC] = R_DrawSpan_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_SPLAT] = R_DrawSplat_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_NPO2_8;
-	spanfuncs_npo2[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_NPO2_8;
+		spanfuncs_npo2[BASEDRAWFUNC] = R_DrawSpan_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_SPLAT] = R_DrawSplat_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPLAT] = R_DrawTiltedTranslucentSplat_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_NPO2_8;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_NPO2_8;
+	}
+	else
+		I_Error("unknown bytes per pixel mode %d\n", vid.bpp);
 }
 
 void SCR_SetMode(void)
@@ -234,48 +199,6 @@ void SCR_SetMode(void)
 //
 void SCR_Startup(void)
 {
-	const CPUInfoFlags *RCpuInfo = I_CPUInfo();
-	if (!M_CheckParm("-NOCPUID") && RCpuInfo)
-	{
-#if defined (__i386__) || defined (_M_IX86) || defined (__WATCOMC__)
-		R_486 = true;
-#endif
-		if (RCpuInfo->RDTSC)
-			R_586 = true;
-		if (RCpuInfo->MMX)
-			R_MMX = true;
-		if (RCpuInfo->AMD3DNow)
-			R_3DNow = true;
-		if (RCpuInfo->MMXExt)
-			R_MMXExt = true;
-		if (RCpuInfo->SSE)
-			R_SSE = true;
-		if (RCpuInfo->SSE2)
-			R_SSE2 = true;
-		CONS_Printf("CPU Info: 486: %i, 586: %i, MMX: %i, 3DNow: %i, MMXExt: %i, SSE2: %i\n", R_486, R_586, R_MMX, R_3DNow, R_MMXExt, R_SSE2);
-	}
-
-	if (M_CheckParm("-486"))
-		R_486 = true;
-	if (M_CheckParm("-586"))
-		R_586 = true;
-	if (M_CheckParm("-MMX"))
-		R_MMX = true;
-	if (M_CheckParm("-3DNow"))
-		R_3DNow = true;
-	if (M_CheckParm("-MMXExt"))
-		R_MMXExt = true;
-
-	if (M_CheckParm("-SSE"))
-		R_SSE = true;
-	if (M_CheckParm("-noSSE"))
-		R_SSE = false;
-
-	if (M_CheckParm("-SSE2"))
-		R_SSE2 = true;
-
-	M_SetupMemcpy();
-
 	if (dedicated)
 	{
 		V_Init();
@@ -341,8 +264,6 @@ void SCR_CheckDefaultMode(void)
 {
 	INT32 scr_forcex, scr_forcey; // resolution asked from the cmd-line
 
-	scr_startupmodeset = true;
-
 	if (dedicated)
 		return;
 
@@ -355,11 +276,6 @@ void SCR_CheckDefaultMode(void)
 	if (M_CheckParm("-height") && M_IsNextParm())
 		scr_forcey = atoi(M_GetNextParm());
 
-#ifdef NATIVESCREENRES
-	if (cv_nativeres.value)
-		SCR_CheckNativeMode();
-#endif
-
 	if (scr_forcex && scr_forcey)
 	{
 		CONS_Printf(M_GetText("Using resolution: %d x %d\n"), scr_forcex, scr_forcey);
@@ -371,8 +287,10 @@ void SCR_CheckDefaultMode(void)
 		CONS_Printf(M_GetText("Default resolution: %d x %d\n"), cv_scr_width.value, cv_scr_height.value);
 		CONS_Printf(M_GetText("Windowed resolution: %d x %d\n"), cv_scr_width_w.value, cv_scr_height_w.value);
 		CONS_Printf(M_GetText("Default bit depth: %d bits\n"), cv_scr_depth.value);
-		
-		SCR_SetModeFromConfig();
+		if (cv_fullscreen.value)
+			setmodeneeded = VID_GetModeForSize(cv_scr_width.value, cv_scr_height.value) + 1; // see note above
+		else
+			setmodeneeded = VID_GetModeForSize(cv_scr_width_w.value, cv_scr_height_w.value) + 1; // see note above
 
 		if (setmodeneeded <= 0)
 			CONS_Alert(CONS_WARNING, "Invalid resolution given, defaulting to base resolution\n");
@@ -397,15 +315,6 @@ void SCR_SetDefaultMode(void)
 	CV_SetValue(cv_fullscreen.value ? &cv_scr_height : &cv_scr_height_w, vid.height);
 }
 
-// Set the mode number based on the resolution saved in the config
-void SCR_SetModeFromConfig(void)
-{
-	if (cv_fullscreen.value)
-		setmodeneeded = VID_GetModeForSize(cv_scr_width.value, cv_scr_height.value) + 1; // see note above
-	else
-		setmodeneeded = VID_GetModeForSize(cv_scr_width_w.value, cv_scr_height_w.value) + 1; // see note above
-}
-
 // Change fullscreen on/off according to cv_fullscreen
 void SCR_ChangeFullscreen(void)
 {
@@ -418,20 +327,15 @@ void SCR_ChangeFullscreen(void)
 	if (graphics_started)
 	{
 		VID_PrepareModeList();
-
-#ifdef NATIVESCREENRES
-		if (cv_nativeres.value)
-			SCR_SetModeFromConfig();
+		if (cv_fullscreen.value)
+			setmodeneeded = VID_GetModeForSize(cv_scr_width.value, cv_scr_height.value) + 1;
 		else
-#endif
-		{
-			SCR_SetModeFromConfig();
+			setmodeneeded = VID_GetModeForSize(cv_scr_width_w.value, cv_scr_height_w.value) + 1;
 
-			if (setmodeneeded <= 0) // hacky safeguard
-			{
-				CONS_Alert(CONS_WARNING, "Invalid resolution given, defaulting to base resolution.\n");
-				setmodeneeded = VID_GetModeForSize(BASEVIDWIDTH, BASEVIDHEIGHT) + 1;
-			}
+		if (setmodeneeded <= 0) // hacky safeguard
+		{
+			CONS_Alert(CONS_WARNING, "Invalid resolution given, defaulting to base resolution.\n");
+			setmodeneeded = VID_GetModeForSize(BASEVIDWIDTH, BASEVIDHEIGHT) + 1;
 		}
 	}
 	return;
@@ -452,16 +356,13 @@ void SCR_ChangeRenderer(void)
 		if (M_CheckParm("-nogl"))
 			CONS_Alert(CONS_ERROR, "OpenGL rendering was disabled!\n");
 		else
-		{
-			renderswitcherror = render_opengl;
 			CONS_Alert(CONS_ERROR, "OpenGL never loaded\n");
-		}
-
 		return;
 	}
 
 	if (rendermode == render_opengl && (vid.glstate == VID_GL_LIBRARY_LOADED)) // Clear these out before switching to software
 		HWR_ClearAllTextures();
+
 #endif
 
 	// Set the new render mode
@@ -476,160 +377,6 @@ boolean SCR_IsAspectCorrect(INT32 width, INT32 height)
 	 && width / BASEVIDWIDTH == height / BASEVIDHEIGHT
 	 );
 }
-
-#ifdef NATIVESCREENRES
-void SCR_CheckNativeMode(void)
-{
-	INT32 w, h;
-
-	VID_GetNativeResolution(&w, &h);
-
-	if (w || h)
-		SCR_SetMaxNativeResDivider(SCR_GetMaxNativeResDivider(w, h));
-
-	if (cv_nativeresauto.value)
-		scr_resdiv = SCR_GetNativeResDivider(w, h);
-	else
-		scr_resdiv = FixedToFloat(cv_nativeresdiv.value);
-}
-
-void SCR_ResetNativeResDivider(void)
-{
-	float resdiv = atof(cv_nativeresdiv.defaultvalue);
-	char f[9];
-
-	scr_resdiv = resdiv;
-
-	snprintf(f, sizeof(f), "%.6f", resdiv);
-	CV_StealthSet(&cv_nativeresdiv, cv_nativeresdiv.defaultvalue);
-}
-
-static void SCR_ToggleNativeRes(void)
-{
-	INT32 mode = VID_GetModeForSize(cv_scr_width.value, cv_scr_height.value);
-	if (mode == -1)
-		mode = VID_GetModeForSize(BASEVIDWIDTH, BASEVIDHEIGHT);
-
-	setmodeneeded = mode + 1;
-	scr_resdiv = FixedToFloat(cv_nativeresdiv.value);
-}
-
-static void SCR_NativeResDivChanged(void)
-{
-	CV_StealthSetValue(&cv_nativeresauto, 0);
-	CV_StealthSetValue(&cv_nativeres, 1);
-	SCR_ToggleNativeRes();
-}
-
-static void SCR_NativeResAutoChanged(void)
-{
-	if (!scr_startupmodeset)
-		return;
-
-	if (cv_nativeresauto.value)
-	{
-		INT32 w = 0, h = 0;
-		char f[16];
-
-		// Set for next resolution change
-		VID_GetNativeResolution(&w, &h);
-		scr_resdiv = SCR_GetNativeResDivider(w, h);
-
-		// Stealth change current resolution divider variable
-		snprintf(f, sizeof(f), "%.6f", scr_resdiv);
-		CV_StealthSet(&cv_nativeresdiv, f);
-	}
-	else
-		SCR_ResetNativeResDivider();
-
-	if (cv_nativeres.value)
-	{
-		SCR_SetModeFromConfig();
-
-		if (setmodeneeded <= 0)
-			setmodeneeded = VID_GetModeForSize(BASEVIDWIDTH, BASEVIDHEIGHT) + 1;
-	}
-}
-
-#define RESDIVFACTOR (1.0f / 16.0f)
-
-static INT32 SCR_CalcDup(INT32 width, INT32 height)
-{
-	INT32 dupx = max(1, width / BASEVIDWIDTH);
-	INT32 dupy = max(1, height / BASEVIDHEIGHT);
-
-	if (!cv_nativerescompare.value)
-		return (dupx >= dupy ? dupx : dupy);
-	else
-		return (dupx < dupy ? dupx : dupy);
-}
-
-float SCR_GetNativeResDivider(INT32 width, INT32 height)
-{
-	if (cv_nativeresauto.value)
-	{
-		float w = (float)width;
-		float h = (float)height;
-		float wsize, hsize;
-		float div = 1.0f;
-
-		while (true)
-		{
-			INT32 iw, ih;
-			INT32 dup, corner;
-
-			wsize = (w / div);
-			hsize = (h / div);
-
-			iw = (INT32)wsize;
-			ih = (INT32)hsize;
-
-			dup = SCR_CalcDup(iw, ih);
-			corner = (iw - (BASEVIDWIDTH * dup)) / 2;
-
-			if (corner < iw / 5)
-				break;
-
-			if (wsize <= BASEVIDWIDTH || hsize <= BASEVIDHEIGHT)
-				break;
-
-			div += 0.25f;
-		}
-
-		return min(div, FixedToFloat(nativeresdiv_cons_t[1].value));
-	}
-
-	return FixedToFloat(cv_nativeresdiv.value);
-}
-
-float SCR_GetMaxNativeResDivider(INT32 nw, INT32 nh)
-{
-	float w, h;
-	float div = 1.0f;
-
-	if (!nw || !nh)
-		VID_GetNativeResolution(&nw, &nh);
-
-	w = (float)nw;
-	h = (float)nh;
-
-	while (true)
-	{
-		w = ((float)nw / div);
-		h = ((float)nh / div);
-		if (w <= (INT32)BASEVIDWIDTH || h <= (INT32)BASEVIDHEIGHT)
-			return div;
-		div += RESDIVFACTOR;
-	}
-
-	return div;
-}
-
-void SCR_SetMaxNativeResDivider(float max)
-{
-	nativeresdiv_cons_t[1].value = FloatToFixed(max);
-}
-#endif
 
 double averageFPS = 0.0f;
 
@@ -679,7 +426,7 @@ void SCR_CalculateFPS(void)
 void SCR_DisplayTicRate(void)
 {
 	INT32 ticcntcolor = 0;
-	const INT32 h = vid.height-(8*vid.dupy);
+	const INT32 h = vid.height-(8*vid.dup);
 	UINT32 cap = R_GetFramerateCap();
 	double fps = round(averageFPS);
 
@@ -715,7 +462,7 @@ void SCR_DisplayTicRate(void)
 
 		width = V_StringWidth(drawnstr, V_NOSCALESTART);
 
-		V_DrawString(vid.width - ((7 * 8 * vid.dupx) + V_StringWidth("FPS: ", V_NOSCALESTART)), h,
+		V_DrawString(vid.width - ((7 * 8 * vid.dup) + V_StringWidth("FPS: ", V_NOSCALESTART)), h,
 			V_YELLOWMAP|V_NOSCALESTART|V_USERHUDTRANS, "FPS:");
 		V_DrawString(vid.width - width, h,
 			ticcntcolor|V_NOSCALESTART|V_USERHUDTRANS, drawnstr);
@@ -732,11 +479,12 @@ void SCR_DisplayLocalPing(void)
 	}
 }
 
+
 void SCR_ClosedCaptions(void)
 {
 	UINT8 i;
 	boolean gamestopped = (paused || P_AutoPause());
-	INT32 basey = BASEVIDHEIGHT;
+	INT32 basey = BASEVIDHEIGHT - 20;
 
 	if (gamestate != wipegamestate)
 		return;
@@ -747,19 +495,18 @@ void SCR_ClosedCaptions(void)
 			basey -= 42;
 		else if (splitscreen)
 			basey -= 8;
-		else if ((modeattacking == ATTACKING_NIGHTS)
-		|| (!(maptol & TOL_NIGHTS)
+		else if (LUA_HudEnabled(hud_powerups)
 		&& ((cv_powerupdisplay.value == 2) // "Always"
-		 || (cv_powerupdisplay.value == 1 && !camera.chase)))) // "First-person only"
+		 || (cv_powerupdisplay.value == 1 && !camera.chase))) // "First-person only"
 			basey -= 16;
 	}
 
 	for (i = 0; i < NUMCAPTIONS; i++)
 	{
-		INT32 flags, x, y, h = 10;
+		INT32 flags;
+		fixed_t y;
 		char dot;
 		boolean music;
-		const char *caption;
 
 		if (!closedcaptions[i].s)
 			continue;
@@ -770,15 +517,19 @@ void SCR_ClosedCaptions(void)
 			continue;
 
 		flags = V_SNAPTORIGHT|V_SNAPTOBOTTOM|V_ALLOWLOWERCASE;
-		x = BASEVIDWIDTH - 20;
-		y = basey-((i + 2)*h);
+		y = (basey-(i*10)) * FRACUNIT;
 
 		if (closedcaptions[i].b)
 		{
-			y -= closedcaptions[i].b * vid.dupy;
 			if (renderisnewtic)
-			{
 				closedcaptions[i].b--;
+
+			if (closedcaptions[i].b) // If the caption hasn't reached its final destination...
+			{
+				y -= closedcaptions[i].b * 4 * FRACUNIT; // ...move it per tic...
+				y += (rendertimefrac % FRACUNIT) * 4; // ...and interpolate it per frame
+				// We have to modulo it by FRACUNIT, so that it won't be a tic ahead with interpolation disabled
+				// Unlike everything else, captions are (intentionally) interpolated from T to T+1 instead of T-1 to T
 			}
 		}
 
@@ -792,8 +543,8 @@ void SCR_ClosedCaptions(void)
 		else
 			dot = ' ';
 
-		caption = va("%c [%s]", dot, (closedcaptions[i].s->caption[0] ? closedcaptions[i].s->caption : closedcaptions[i].s->name));
-		V_DrawRightAlignedString(x, y, flags, caption);
+		V_DrawRightAlignedStringAtFixed((BASEVIDWIDTH-20) * FRACUNIT, y, flags,
+			va("%c [%s]", dot, (closedcaptions[i].s->caption[0] ? closedcaptions[i].s->caption : closedcaptions[i].s->name)));
 	}
 }
 
@@ -825,9 +576,9 @@ void SCR_DisplayMarathonInfo(void)
 #define PRIMEV1 13
 #define PRIMEV2 17 // I can't believe it! I'm on TV!
 		antisplice[0] += (entertic - oldentertics)*PRIMEV2;
-		antisplice[0] %= PRIMEV1*((vid.width/vid.dupx)+1);
+		antisplice[0] %= PRIMEV1*((vid.width/vid.dup)+1);
 		antisplice[1] += (entertic - oldentertics)*PRIMEV1;
-		antisplice[1] %= PRIMEV1*((vid.width/vid.dupx)+1);
+		antisplice[1] %= PRIMEV1*((vid.width/vid.dup)+1);
 		str = va("%i:%02i:%02i.%02i",
 			G_TicsToHours(marathontime),
 			G_TicsToMinutes(marathontime, false),
